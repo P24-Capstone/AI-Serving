@@ -13,8 +13,8 @@ from typing import Optional
 import uvicorn
 from dotenv import load_dotenv
 
-# Qwen-VL 관련 라이브러리 추가
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+# 🔥 여기서 Qwen2_5_VLForConditionalGeneration 으로 변경되었습니다!
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 # 환경 변수 로드 (.env)
@@ -47,7 +47,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 print("3. Qwen2.5-VL-3B 모델 로딩 중... (시간이 다소 소요됩니다)")
-model_qwen = Qwen2VLForConditionalGeneration.from_pretrained(
+# 🔥 여기도 Qwen2_5_VLForConditionalGeneration 으로 변경되었습니다!
+model_qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2.5-VL-3B-Instruct", 
     torch_dtype=torch.float16, 
     device_map="auto"
@@ -129,7 +130,7 @@ async def meeting_record(
 
 
 # ==========================================
-# 🖼️ [기능 2] 미션 인증: Qwen2.5-VL-3B 로컬 처리
+# 🖼️ [기능 2] 미션 인증: Qwen2.5-VL-3B 로컬 처리 (메모리 최적화 적용)
 # ==========================================
 @app.post("/verify", response_model=VerifyResponse)
 async def verify_mission(
@@ -141,20 +142,25 @@ async def verify_mission(
         f"미션 내용: {request.mission_content}\n"
         + (f"추가 조건: {request.verify_prompt}\n" if request.verify_prompt else "")
         + f"제출 내용: {request.verify_content}\n\n"
-        + "위 내용과 이미지를 분석하여 미션 성공 여부를 판단해. 반드시 아래 JSON 형식으로만 대답해:\n"
-        + '{"rejected": false, "reason": "성공/실패 판단 이유를 구체적으로 작성"}\n'
-        + "조건을 하나라도 어겼거나 이미지가 불분명하면 rejected를 true로 설정해."
+        + "위 내용과 이미지를 분석하여 미션 성공 여부를 판단해 주세요. 반드시 아래 JSON 형식으로만 대답해 주셔야 합니다:\n"
+        + '{"rejected": false, "reason": "성공 또는 실패로 판단한 이유를 구체적인 존댓말(예: ~습니다)로 작성해 주세요."}\n'
+        + "조건을 하나라도 어겼거나 이미지가 불분명하면 rejected를 true로 설정해 주세요."
     )
 
     content_list = []
     if request.image_url:
-        content_list.append({"type": "image", "image": request.image_url})
+        # 💡 [해결 1] 해상도 강제 제한: VRAM 폭발을 막기 위해 이미지 크기를 줄여서 인식시킵니다.
+        content_list.append({
+            "type": "image", 
+            "image": request.image_url,
+            "max_pixels": 313600  # 약 560x560 픽셀 제한 (인식률은 유지하며 메모리 대폭 절약)
+        })
     content_list.append({"type": "text", "text": system_prompt})
 
     messages = [{"role": "user", "content": content_list}]
 
     try:
-        # 동시 요청 시 1건씩 순차 처리 (OOM 방지)
+        # 동시 요청 시 1건씩 순차 처리
         async with gpu_lock:
             text = processor_qwen.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs = process_vision_info(messages)
@@ -166,7 +172,10 @@ async def verify_mission(
                 return_tensors="pt",
             ).to("cuda")
 
-            generated_ids = model_qwen.generate(**inputs, max_new_tokens=256)
+            # 💡 [해결 2] No Grad: "학습(Training) 안 할 거니까 연산 기록 저장하지 마!" 라고 선언
+            with torch.no_grad():
+                generated_ids = model_qwen.generate(**inputs, max_new_tokens=256)
+            
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
             ]
@@ -188,6 +197,9 @@ async def verify_mission(
         raise HTTPException(status_code=500, detail="AI가 JSON 형식이 아닌 응답을 반환했습니다.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"미션 분석 중 에러가 발생했습니다: {str(e)}")
+    finally:
+        # 💡 [해결 3] 캐시 청소: 한 번 처리가 끝날 때마다 GPU 메모리 찌꺼기를 물청소해 줍니다.
+        torch.cuda.empty_cache()
 
 
 # ==========================================
