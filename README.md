@@ -4,6 +4,23 @@ pip install -U openai-whisper torch
 pip install openai fastapi uvicorn python-multipart
 pip install python-dotenv
 
+qwen 설치
+pip install git+https://github.com/huggingface/transformers accelerate
+pip install qwen-vl-utils==0.0.8
+pip install --upgrade torch torchvision torchaudio einops
+
+통신용 https 개설
+apt-get update
+apt-get install -y nodejs npm
+
+
+키 입력
+cd AI-Serving
+echo "OPENAI_API_KEY=sk-본인의_오픈AI_키" > .env
+echo "MY_GCUBE_SECRET=본인이_설정한_비밀번호" >> .env
+확인인
+cat .env
+
 2단계: 전체 흐름(파이프라인) 
 
 입력: 사용자가 음성 파일(mp3, wav 등)을 서버로 보냄.
