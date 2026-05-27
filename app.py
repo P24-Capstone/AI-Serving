@@ -5,6 +5,7 @@ import requests
 import asyncio
 import torch
 import whisper
+import re
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.security import APIKeyHeader
 from openai import OpenAI
@@ -12,109 +13,112 @@ from pydantic import BaseModel
 from typing import Optional
 import uvicorn
 from dotenv import load_dotenv
-
-# 🔥 여기서 Qwen2_5_VLForConditionalGeneration 으로 변경되었습니다!
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
+from PIL import Image
 
-# 환경 변수 로드 (.env)
 load_dotenv()
-
 app = FastAPI(title="AI Serving API Server")
 
-# ==========================================
-# 🛡️ 보안 인증 로직 (API Key)
-# ==========================================
+# 보안 인증
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 MY_SECRET_KEY = os.getenv("MY_GCUBE_SECRET")
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
-    """요청마다 X-API-Key 헤더가 올바른지 검사"""
     if api_key != MY_SECRET_KEY:
-        raise HTTPException(status_code=403, detail="접근 권한이 없습니다. (Invalid API Key)")
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
     return api_key
 
-
-# ==========================================
-# 🤖 AI 모델 초기화 (서버 가동 시 1회만 실행)
-# ==========================================
-print("1. Whisper(STT) 모델 로딩 중...")
+# 모델 로딩
+print("1. 모델 로딩 중...")
 model_whisper = whisper.load_model("base")
-
-print("2. OpenAI 클라이언트 연결 중...")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-print("3. Qwen2.5-VL-3B 모델 로딩 중... (시간이 다소 소요됩니다)")
-# 🔥 여기도 Qwen2_5_VLForConditionalGeneration 으로 변경되었습니다!
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 model_qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-3B-Instruct", 
-    torch_dtype=torch.float16, 
-    device_map="auto"
+    "Qwen/Qwen2.5-VL-3B-Instruct", torch_dtype=torch.float16, device_map="auto"
 )
 processor_qwen = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-print("✅ 모든 AI 모델 로딩 완료!")
-
-# GPU 메모리 부족(OOM) 방지를 위한 대기열 자물쇠 (동시 처리 1건으로 제한)
 gpu_lock = asyncio.Semaphore(1)
 
-
-# ==========================================
-# 📋 요청/응답 스키마 (데이터 구조 정의)
-# ==========================================
+# 스키마 정의
 class MeetingRecordRequest(BaseModel):
-    rec_file_key: str  # 오디오 파일 URL
+    rec_file_key: str
 
 class MeetingRecordResponse(BaseModel):
     title: str
     full_script: str
     summary: str
-
+    
 class VerifyRequest(BaseModel):
-    mission_content: str                  # 미션 내용
-    verify_prompt: Optional[str] = None   # 추가 인증 조건 (선택)
-    verify_content: str                   # 제출 내용 (텍스트)
-    image_url: Optional[str] = None       # 첨부 이미지 URL (선택)
+    mission_content: str
+    verify_prompt: Optional[str] = None
+    verify_content: str
+    image_url: Optional[str] = None
 
 class VerifyResponse(BaseModel):
-    rejected: bool                        # true = 미달, false = 통과
-    reason: str                           # 판단 이유
+    rejected: bool
+    reason: str
 
+def _extract_json(raw: str) -> dict:
+   import re
 
-# ==========================================
-# 🎙️ [기능 1] 회의록: 오디오 URL → STT → 제목/요약
-# ==========================================
+def _extract_json(raw: str) -> dict:
+    """
+    모델 출력에서 JSON 객체를 추출한다.
+    만약 모델이 JSON 포맷(중괄호)을 무시하고 쌩 텍스트로 답해도 이를 파싱해낸다.
+    """
+    text = raw.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end   = text.rfind("}")
+    
+    # [플랜 A] 정상적으로 중괄호를 찾은 경우
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass # 파싱 실패 시 아래 플랜 B로 넘어감
+            
+    # [플랜 B] 모델이 중괄호 없이 "false, '이유'" 형태로 뱉었을 때의 야매 파싱
+    raw_lower = raw.lower()
+    
+    # 1. rejected 여부 판단 (true가 앞에 있으면 True, 아니면 False)
+    rejected = False
+    if "true" in raw_lower[:15]:
+        rejected = True
+        
+    # 2. 이유(reason) 추출: 쌍따옴표 안의 문장을 찾음
+    reason_match = re.search(r'"([^"]*)"', raw)
+    if reason_match:
+        reason = reason_match.group(1)
+    else:
+        # 쌍따옴표도 없다면 true, false, 쉼표 등을 지우고 남은 텍스트를 통째로 사용
+        reason = raw.replace("true", "").replace("false", "").replace("True", "").replace("False", "").replace(",", "").strip()
+        
+    return {"rejected": rejected, "reason": reason}
+
 @app.post("/meeting-record", response_model=MeetingRecordResponse)
-async def meeting_record(
-    request: MeetingRecordRequest, 
-    api_key: str = Depends(verify_api_key)
-):
+async def meeting_record(request: MeetingRecordRequest, api_key: str = Depends(verify_api_key)):
+    tmp_path = None
     try:
-        audio_resp = requests.get(request.rec_file_key, timeout=60)
-        audio_resp.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"오디오 파일 다운로드 실패: {str(e)}")
-
-    ext = os.path.splitext(request.rec_file_key.split("?")[0])[-1] or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(audio_resp.content)
-        tmp_path = tmp.name
-
-    try:
+        response = requests.get(request.rec_file_key, timeout=60, stream=True)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp.write(chunk)
+            tmp_path = tmp.name
+        
         # Whisper STT
         result = model_whisper.transcribe(tmp_path)
         full_script = result["text"]
-
-        # GPT-4o-mini 요약
+        
+        # GPT 요약
         gpt_resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": '너는 회의록 전문 작성가야. 아래 JSON 형식으로만 응답해:\n{"title": "회의 제목 (20자 이내)", "summary": "핵심 내용 요약"}'},
+                {"role": "system", "content": '회의록 전문가입니다. JSON으로 응답해: {"title": "제목(20자)", "summary": "요약"}'},
                 {"role": "user", "content": full_script},
             ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
+            response_format={"type": "json_object"}
         )
         parsed = json.loads(gpt_resp.choices[0].message.content)
         return MeetingRecordResponse(
@@ -122,127 +126,86 @@ async def meeting_record(
             full_script=full_script, 
             summary=parsed.get("summary", "")
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"처리 중 오류: {str(e)}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
 
 
-# ==========================================
-# 🖼️ [기능 2] 미션 인증: Qwen2.5-VL-3B 로컬 처리 (메모리 최적화 적용)
-# ==========================================
 @app.post("/verify", response_model=VerifyResponse)
-async def verify_mission(
-    request: VerifyRequest, 
-    api_key: str = Depends(verify_api_key)
-):
-    # AI 프롬프트 작성
-    system_prompt = (
-        f"미션 내용: {request.mission_content}\n"
-        + (f"추가 조건: {request.verify_prompt}\n" if request.verify_prompt else "")
-        + f"제출 내용: {request.verify_content}\n\n"
-        + "위 내용과 이미지를 분석하여 미션 성공 여부를 판단해 주세요. 반드시 아래 JSON 형식으로만 대답해 주셔야 합니다:\n"
-        + '{"rejected": false, "reason": "성공 또는 실패로 판단한 이유를 구체적인 존댓말(예: ~습니다)로 작성해 주세요."}\n'
-        + "조건을 하나라도 어겼거나 이미지가 불분명하면 rejected를 true로 설정해 주세요."
-    )
-
-    content_list = []
-    if request.image_url:
-        # 💡 [해결 1] 해상도 강제 제한: VRAM 폭발을 막기 위해 이미지 크기를 줄여서 인식시킵니다.
-        content_list.append({
-            "type": "image", 
-            "image": request.image_url,
-            "max_pixels": 313600  # 약 560x560 픽셀 제한 (인식률은 유지하며 메모리 대폭 절약)
-        })
-    content_list.append({"type": "text", "text": system_prompt})
-
-    messages = [{"role": "user", "content": content_list}]
-
+async def verify_mission(request: VerifyRequest, api_key: str = Depends(verify_api_key)):
     try:
-        # 동시 요청 시 1건씩 순차 처리
         async with gpu_lock:
+            content_list = []
+
+            # [이미지 처리]
+            if request.image_url:
+                resp = requests.get(request.image_url, stream=True, timeout=15)
+                resp.raise_for_status()
+                image = Image.open(resp.raw).convert("RGB")
+                content_list.append({"type": "image", "image": image, "max_pixels": 313600})
+
+            # [프롬프트] — verify_prompt(검증 기준) 포함, 반환 형식 명시
+            criteria = request.verify_prompt if request.verify_prompt else "미션 내용과 일치하는지 판단하세요."
+            user_text = (
+                f"[미션 설명] {request.mission_content}\n"
+                f"[검증 기준] {criteria}\n"
+                f"[제출자 설명] {request.verify_content or '(설명 없음)'}\n\n"
+                "위 기준을 바탕으로 첨부 이미지와 제출 내용이 미션 인증 조건을 충족하는지 판단하세요.\n"
+                "다음 JSON 형식으로만 결과값을 출력하세요.\n"
+                "다른 설명이나 문장은 절대 포함하지 마세요.\n"
+                "{\n"
+                '  "rejected": true/false,\n'
+                '  "reason": "판정 이유를 한국어로 짧게 작성"\n'
+                "}"
+            )
+            content_list.append({"type": "text", "text": user_text})
+
+            # [메시지] — system 역할로 JSON 전용 출력 강제
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 미션 인증 판정 AI입니다. "
+                        "사용자의 요청에 대해 반드시 {\"rejected\": boolean, \"reason\": string} "
+                        "형태의 JSON만 출력해야 합니다. 다른 텍스트는 출력하지 마세요."
+                    ),
+                },
+                {"role": "user", "content": content_list},
+            ]
+
+            # [모델 추론]
             text = processor_qwen.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            
+            image_inputs, _ = process_vision_info(messages)
             inputs = processor_qwen(
-                text=[text],
-                images=image_inputs,
-                padding=True,
-                return_tensors="pt",
+                text=[text], images=image_inputs, padding=True, return_tensors="pt"
             ).to("cuda")
 
-            # 💡 [해결 2] No Grad: "학습(Training) 안 할 거니까 연산 기록 저장하지 마!" 라고 선언
             with torch.no_grad():
                 generated_ids = model_qwen.generate(**inputs, max_new_tokens=256)
-            
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            
-            output_text = processor_qwen.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+
+            raw_output = processor_qwen.batch_decode(
+                [generated_ids[0][inputs.input_ids.shape[1]:]], skip_special_tokens=True
             )[0]
 
-        # 마크다운 찌꺼기 제거 후 JSON 파싱
-        cleaned_output = output_text.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(cleaned_output)
-        
-        return VerifyResponse(
-            rejected=bool(parsed.get("rejected", False)),
-            reason=str(parsed.get("reason", ""))
-        )
+            torch.cuda.empty_cache()
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI가 JSON 형식이 아닌 응답을 반환했습니다.")
+            # [JSON 파싱] — 추출 실패 시 서버 오류 대신 "대기(P 유지)" 응답 반환
+            try:
+                parsed = _extract_json(raw_output)
+                rejected = bool(parsed.get("rejected", False))
+                reason   = str(parsed.get("reason", ""))
+            except (ValueError, json.JSONDecodeError) as parse_err:
+                # 파싱 실패: 백엔드가 상태를 P(대기)로 유지하도록 예외를 그대로 올림
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"AI 모델이 유효한 JSON을 반환하지 않았습니다: {parse_err}",
+                )
+
+            return VerifyResponse(rejected=rejected, reason=reason)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"미션 분석 중 에러가 발생했습니다: {str(e)}")
-    finally:
-        # 💡 [해결 3] 캐시 청소: 한 번 처리가 끝날 때마다 GPU 메모리 찌꺼기를 물청소해 줍니다.
-        torch.cuda.empty_cache()
-
-
-# ==========================================
-# 🎙️ [기능 3] 직접 파일 업로드 기반 STT (테스트용)
-# ==========================================
-@app.post("/process-audio")
-async def process_audio(
-    file: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key)
-):
-    if not file.filename.endswith((".mp3", ".wav", ".m4a")):
-        raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        contents = await file.read()
-        tmp.write(contents)
-        tmp_path = tmp.name
-
-    try:
-        result = model_whisper.transcribe(tmp_path)
-        transcribed_text = result["text"]
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "너는 전문 요약가야. 제공된 텍스트를 핵심 내용만 깔끔하게 요약해줘."},
-                {"role": "user", "content": transcribed_text},
-            ],
-            temperature=0.3,
-        )
-        summary_text = response.choices[0].message.content
-
-        return {
-            "status": "success",
-            "original_text": transcribed_text,
-            "summary": summary_text,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"에러가 발생했습니다: {str(e)}")
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
+        raise HTTPException(status_code=500, detail=f"에러 발생: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
